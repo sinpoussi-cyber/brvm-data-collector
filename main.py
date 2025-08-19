@@ -1,5 +1,5 @@
 # ==============================================================================
-# BRVM BOC SCRAPER - V2.0 (GitHub Actions & Service Account)
+# BRVM BOC SCRAPER - V2.1 (GitHub Actions & Gestion Quota Sheets)
 # ==============================================================================
 
 # --- Imports ---
@@ -86,6 +86,12 @@ def prepare_worksheets_metadata(spreadsheet):
         return None
 
     for title, ws in title_to_ws.items():
+        # ======================================================================
+        # CORRECTION : Ajout d'une pause pour éviter de dépasser le quota de
+        # lecture de l'API Google Sheets (60 requêtes/minute).
+        # ======================================================================
+        time.sleep(1.1)
+
         try:
             header = ws.row_values(1)
         except Exception as e:
@@ -102,7 +108,6 @@ def prepare_worksheets_metadata(spreadsheet):
             "valeurs": find_index_by_keywords(header_norms, KEYS["valeurs"]) or 4,
         }
 
-        # Override spécial pour 'Actions_BRVM'
         if "ACTIONS" in normalize_text(title) and "BRVM" in normalize_text(title):
             indices = {"date": 0, "sym": 1, "cours": 2, "volume": 3, "valeurs": 4}
             logging.info(f"Feuille '{title}': mapping Actions_BRVM forcé.")
@@ -220,7 +225,6 @@ def run():
             else:
                 unmatched.append([date_only, raw_sym, rec.get('Cours (F CFA)',''), rec.get('Volume échangé',''), rec.get('Valeurs échangées (F CFA)','')])
 
-    # Écriture groupée sur Google Sheets
     for title, rows in pending_appends.items():
         if rows:
             ws = title_to_ws.get(title)
