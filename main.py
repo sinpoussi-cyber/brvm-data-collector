@@ -1,5 +1,5 @@
 # ==============================================================================
-# BRVM BOC SCRAPER - V2.1 (GitHub Actions & Gestion Quota Sheets)
+# BRVM BOC SCRAPER - V2.2 (Final - Logique Métier Corrigée)
 # ==============================================================================
 
 # --- Imports ---
@@ -12,6 +12,7 @@ import os
 import json
 from io import BytesIO
 from collections import defaultdict
+from datetime import datetime
 
 import pdfplumber
 import requests
@@ -26,12 +27,12 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- Paramètres Globaux ---
 SPREADSHEET_ID = '1EGXyg13ml8a9zr4OaUPnJN3i-rwVO2uq330yfxJXnSM'
-DEFAULT_HEADERS = ["Date", "Symbole", "Cours (F CFA)", "Volume échangé", "Valeurs échangées (F CFA)"]
+DEFAULT_HEADERS = ["Symbole", "Date", "Cours (F CFA)", "Volume échangé", "Valeurs échangées (F CFA)"]
 
 # Keywords pour la reconnaissance des colonnes
 KEYS = {
-    "date": ["DATE", "YYYY", "YYYYMMDD", "DATE(YYYYMMDD)"],
     "sym": ["SYM", "SYMBOL", "TICKER", "ISSUER", "NOM", "LIBELLE", "ENTREPRISE", "COMPANY"],
+    "date": ["DATE", "YYYY", "YYYYMMDD", "DATE(YYYYMMDD)"],
     "cours": ["COUR", "PRIX", "PRICE"],
     "volume": ["VOLUME"],
     "valeurs": ["VALEUR", "MONTANT", "VALEURS"]
@@ -39,8 +40,7 @@ KEYS = {
 
 # --- Fonctions Utilitaires ---
 def normalize_text(s):
-    if s is None:
-        return ""
+    if s is None: return ""
     s = str(s)
     s = unicodedata.normalize('NFKD', s)
     s = "".join(ch for ch in s if not unicodedata.combining(ch))
@@ -55,7 +55,7 @@ def extract_date_from_filename(url):
 def backoff_sleep(attempt):
     time.sleep(min(2 ** attempt, 30))
 
-# --- Authentification via Compte de Service (pour GitHub Actions) ---
+# --- Authentification via Compte de Service ---
 def authenticate_google_services():
     logging.info("Authentification via compte de service Google...")
     try:
@@ -86,12 +86,7 @@ def prepare_worksheets_metadata(spreadsheet):
         return None
 
     for title, ws in title_to_ws.items():
-        # ======================================================================
-        # CORRECTION : Ajout d'une pause pour éviter de dépasser le quota de
-        # lecture de l'API Google Sheets (60 requêtes/minute).
-        # ======================================================================
         time.sleep(1.1)
-
         try:
             header = ws.row_values(1)
         except Exception as e:
@@ -100,23 +95,25 @@ def prepare_worksheets_metadata(spreadsheet):
         
         header_norms = [normalize_text(h) for h in header]
         
+        # CORRECTION 2 : Ordre des colonnes par défaut inversé (Symbole en 1er)
         indices = {
-            "date": find_index_by_keywords(header_norms, KEYS["date"]) or 0,
-            "sym": find_index_by_keywords(header_norms, KEYS["sym"]) or 1,
+            "sym": find_index_by_keywords(header_norms, KEYS["sym"]) or 0,
+            "date": find_index_by_keywords(header_norms, KEYS["date"]) or 1,
             "cours": find_index_by_keywords(header_norms, KEYS["cours"]) or 2,
             "volume": find_index_by_keywords(header_norms, KEYS["volume"]) or 3,
             "valeurs": find_index_by_keywords(header_norms, KEYS["valeurs"]) or 4,
         }
 
         if "ACTIONS" in normalize_text(title) and "BRVM" in normalize_text(title):
-            indices = {"date": 0, "sym": 1, "cours": 2, "volume": 3, "valeurs": 4}
+            indices = {"sym": 0, "date": 1, "cours": 2, "volume": 3, "valeurs": 4}
             logging.info(f"Feuille '{title}': mapping Actions_BRVM forcé.")
 
         existing_dates = set()
         try:
             col_no = indices["date"] + 1
             col_vals = ws.col_values(col_no)
-            existing_dates = set(v for v in col_vals if re.fullmatch(r'\d{8}', v))
+            # CORRECTION 3 : Le script cherche maintenant les dates au format JJ/MM/AAAA
+            existing_dates = set(v for v in col_vals if re.fullmatch(r'\d{2}/\d{2}/\d{4}', v))
         except Exception as e:
             logging.warning(f"Impossible de lire les dates existantes pour '{title}': {e}")
 
@@ -133,6 +130,10 @@ def get_boc_links():
     for a in soup.find_all('a', href=True):
         href = a['href'].strip()
         if re.search(r'boc_\d{8}_\d+\.pdf$', href, flags=re.IGNORECASE):
+            # CORRECTION 1 : Exclure le bulletin de 2024
+            if 'boc_20241231' in href:
+                logging.info(f"Ignoré (filtre 2024): {href}")
+                continue
             full_url = href if href.startswith('http') else "https://www.brvm.org" + href
             links.add(full_url)
     return sorted(list(links), key=lambda u: extract_date_from_filename(u) or '')
@@ -189,14 +190,21 @@ def run():
     norm_titles_list = list(norm_to_title.keys())
 
     boc_links = get_boc_links()
-    logging.info(f"{len(boc_links)} BOCs trouvés.")
+    logging.info(f"{len(boc_links)} BOCs pertinents trouvés.")
     
     pending_appends = defaultdict(list)
     unmatched = []
 
     for boc in boc_links:
-        date_only = extract_date_from_filename(boc)
-        if not date_only:
+        date_yyyymmdd = extract_date_from_filename(boc)
+        if not date_yyyymmdd:
+            continue
+        
+        # CORRECTION 2 : Conversion de la date au format JJ/MM/AAAA
+        try:
+            formatted_date = datetime.strptime(date_yyyymmdd, '%Y%m%d').strftime('%d/%m/%Y')
+        except ValueError:
+            logging.warning(f"Format de date invalide pour {boc}, skip.")
             continue
 
         rows = extract_data_from_pdf(boc)
@@ -207,23 +215,25 @@ def run():
             
             if ws_title:
                 meta = ws_meta.get(ws_title)
-                if date_only in meta['existing_dates']:
+                # CORRECTION 3 : Vérification du doublon avec la date au bon format
+                if formatted_date in meta['existing_dates']:
                     continue
                 
                 inds = meta['indices']
                 width = max(len(meta['header']), max(inds.values()) + 1)
                 row = [""] * width
                 
-                row[inds['date']] = date_only
+                # CORRECTION 2 : Inversion de l'ordre d'écriture Symbole/Date
                 row[inds['sym']] = raw_sym
+                row[inds['date']] = formatted_date
                 row[inds['cours']] = rec.get('Cours (F CFA)', '')
                 row[inds['volume']] = rec.get('Volume échangé', '')
                 row[inds['valeurs']] = rec.get('Valeurs échangées (F CFA)', '')
                 
                 pending_appends[ws_title].append(row)
-                meta['existing_dates'].add(date_only)
+                meta['existing_dates'].add(formatted_date) # Ajoute la date formatée pour éviter les doublons dans la même session
             else:
-                unmatched.append([date_only, raw_sym, rec.get('Cours (F CFA)',''), rec.get('Volume échangé',''), rec.get('Valeurs échangées (F CFA)','')])
+                unmatched.append([formatted_date, raw_sym, rec.get('Cours (F CFA)',''), rec.get('Volume échangé',''), rec.get('Valeurs échangées (F CFA)','')])
 
     for title, rows in pending_appends.items():
         if rows:
