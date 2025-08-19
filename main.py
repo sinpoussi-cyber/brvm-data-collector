@@ -1,5 +1,5 @@
 # ==============================================================================
-# BRVM BOC SCRAPER - V2.2 (Final - Logique Métier Corrigée)
+# BRVM BOC SCRAPER - V2.3 (Final - Optimisation Quota Sheets)
 # ==============================================================================
 
 # --- Imports ---
@@ -41,12 +41,7 @@ KEYS = {
 # --- Fonctions Utilitaires ---
 def normalize_text(s):
     if s is None: return ""
-    s = str(s)
-    s = unicodedata.normalize('NFKD', s)
-    s = "".join(ch for ch in s if not unicodedata.combining(ch))
-    s = re.sub(r'[^A-Za-z0-9% ]+', ' ', s)
-    s = re.sub(r'\s+', ' ', s).strip()
-    return s.upper()
+    return re.sub(r'\s+', ' ', re.sub(r'[^A-Za-z0-9% ]+', ' ', unicodedata.normalize('NFKD', str(s)).encode('ascii', 'ignore').decode('utf-8'))).strip().upper()
 
 def extract_date_from_filename(url):
     m = re.search(r'boc_(\d{8})', url, flags=re.IGNORECASE)
@@ -61,7 +56,7 @@ def authenticate_google_services():
     try:
         creds_json_str = os.environ.get('GSPREAD_SERVICE_ACCOUNT')
         if not creds_json_str:
-            logging.error("❌ Secret GSPREAD_SERVICE_ACCOUNT introuvable dans l'environnement.")
+            logging.error("❌ Secret GSPREAD_SERVICE_ACCOUNT introuvable.")
             return None
         creds_dict = json.loads(creds_json_str)
         scopes = ['https://www.googleapis.com/auth/spreadsheets']
@@ -76,46 +71,46 @@ def authenticate_google_services():
 # --- Fonctions Principales ---
 def prepare_worksheets_metadata(spreadsheet):
     ws_meta = {}
-    title_to_ws = {ws.title: ws for ws in spreadsheet.worksheets()}
+    worksheets = spreadsheet.worksheets()
+    title_to_ws = {ws.title: ws for ws in worksheets}
 
-    def find_index_by_keywords(header_norms, keywords):
-        for i, hn in enumerate(header_norms):
-            for k in keywords:
-                if k in hn:
-                    return i
-        return None
-
-    for title, ws in title_to_ws.items():
-        time.sleep(1.1)
-        try:
-            header = ws.row_values(1)
-        except Exception as e:
-            logging.warning(f"Impossible de lire l'en-tête pour '{title}': {e}")
-            header = []
+    # ======================================================================
+    # CORRECTION : Lecture groupée des données pour éviter les erreurs de quota
+    # ======================================================================
+    logging.info(f"Lecture groupée des données pour {len(worksheets)} feuilles...")
+    all_sheet_data = spreadsheet.values_get_all(major_dimension='COLUMNS')
+    
+    for i, ws in enumerate(worksheets):
+        title = ws.title
+        sheet_data = all_sheet_data[i]
         
+        header = [row[0] if row else "" for row in sheet_data]
         header_norms = [normalize_text(h) for h in header]
-        
-        # CORRECTION 2 : Ordre des colonnes par défaut inversé (Symbole en 1er)
+
+        def find_index_by_keywords(keywords):
+            for idx, h_norm in enumerate(header_norms):
+                for keyword in keywords:
+                    if keyword in h_norm:
+                        return idx
+            return None
+
         indices = {
-            "sym": find_index_by_keywords(header_norms, KEYS["sym"]) or 0,
-            "date": find_index_by_keywords(header_norms, KEYS["date"]) or 1,
-            "cours": find_index_by_keywords(header_norms, KEYS["cours"]) or 2,
-            "volume": find_index_by_keywords(header_norms, KEYS["volume"]) or 3,
-            "valeurs": find_index_by_keywords(header_norms, KEYS["valeurs"]) or 4,
+            "sym": find_index_by_keywords(KEYS["sym"]) or 0,
+            "date": find_index_by_keywords(KEYS["date"]) or 1,
+            "cours": find_index_by_keywords(KEYS["cours"]) or 2,
+            "volume": find_index_by_keywords(KEYS["volume"]) or 3,
+            "valeurs": find_index_by_keywords(KEYS["valeurs"]) or 4,
         }
 
         if "ACTIONS" in normalize_text(title) and "BRVM" in normalize_text(title):
             indices = {"sym": 0, "date": 1, "cours": 2, "volume": 3, "valeurs": 4}
             logging.info(f"Feuille '{title}': mapping Actions_BRVM forcé.")
 
+        date_col_index = indices["date"]
         existing_dates = set()
-        try:
-            col_no = indices["date"] + 1
-            col_vals = ws.col_values(col_no)
-            # CORRECTION 3 : Le script cherche maintenant les dates au format JJ/MM/AAAA
-            existing_dates = set(v for v in col_vals if re.fullmatch(r'\d{2}/\d{2}/\d{4}', v))
-        except Exception as e:
-            logging.warning(f"Impossible de lire les dates existantes pour '{title}': {e}")
+        if date_col_index < len(sheet_data):
+            date_column = sheet_data[date_col_index]
+            existing_dates = set(v for v in date_column if re.fullmatch(r'\d{2}/\d{2}/\d{4}', v))
 
         ws_meta[title] = {"ws": ws, "header": header, "indices": indices, "existing_dates": existing_dates}
     
@@ -130,7 +125,6 @@ def get_boc_links():
     for a in soup.find_all('a', href=True):
         href = a['href'].strip()
         if re.search(r'boc_\d{8}_\d+\.pdf$', href, flags=re.IGNORECASE):
-            # CORRECTION 1 : Exclure le bulletin de 2024
             if 'boc_20241231' in href:
                 logging.info(f"Ignoré (filtre 2024): {href}")
                 continue
@@ -200,7 +194,6 @@ def run():
         if not date_yyyymmdd:
             continue
         
-        # CORRECTION 2 : Conversion de la date au format JJ/MM/AAAA
         try:
             formatted_date = datetime.strptime(date_yyyymmdd, '%Y%m%d').strftime('%d/%m/%Y')
         except ValueError:
@@ -215,7 +208,6 @@ def run():
             
             if ws_title:
                 meta = ws_meta.get(ws_title)
-                # CORRECTION 3 : Vérification du doublon avec la date au bon format
                 if formatted_date in meta['existing_dates']:
                     continue
                 
@@ -223,7 +215,6 @@ def run():
                 width = max(len(meta['header']), max(inds.values()) + 1)
                 row = [""] * width
                 
-                # CORRECTION 2 : Inversion de l'ordre d'écriture Symbole/Date
                 row[inds['sym']] = raw_sym
                 row[inds['date']] = formatted_date
                 row[inds['cours']] = rec.get('Cours (F CFA)', '')
@@ -231,7 +222,7 @@ def run():
                 row[inds['valeurs']] = rec.get('Valeurs échangées (F CFA)', '')
                 
                 pending_appends[ws_title].append(row)
-                meta['existing_dates'].add(formatted_date) # Ajoute la date formatée pour éviter les doublons dans la même session
+                meta['existing_dates'].add(formatted_date)
             else:
                 unmatched.append([formatted_date, raw_sym, rec.get('Cours (F CFA)',''), rec.get('Volume échangé',''), rec.get('Valeurs échangées (F CFA)','')])
 
